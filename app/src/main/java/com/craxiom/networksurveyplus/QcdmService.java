@@ -1,6 +1,7 @@
 package com.craxiom.networksurveyplus;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.PendingIntent;
 import android.app.Service;
@@ -8,19 +9,27 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.RestrictionsManager;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.location.LocationManager;
-import android.os.Binder;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.provider.Settings;
 
 import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
 import androidx.preference.PreferenceManager;
 
-import com.craxiom.networksurveyplus.mqtt.ConnectionState;
+import com.craxiom.mqttlibrary.IConnectionStateListener;
+import com.craxiom.mqttlibrary.IMqttService;
+import com.craxiom.mqttlibrary.MqttConstants;
+import com.craxiom.mqttlibrary.connection.BrokerConnectionInfo;
+import com.craxiom.mqttlibrary.connection.ConnectionState;
+import com.craxiom.mqttlibrary.ui.AConnectionFragment;
+import com.craxiom.networksurveyplus.mqtt.QcdmMqttConnection;
 import com.google.common.io.ByteStreams;
 
 import java.nio.file.Files;
@@ -37,7 +46,7 @@ import timber.log.Timber;
  *
  * @since 0.1.0
  */
-public class QcdmService extends Service implements SharedPreferences.OnSharedPreferenceChangeListener
+public class QcdmService extends Service implements IConnectionStateListener, SharedPreferences.OnSharedPreferenceChangeListener, IMqttService
 {
     public static final int LOCATION_REFRESH_RATE = 4_000;
 
@@ -50,6 +59,7 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
     private Handler diagHandler;
     private Handler fifoReadHandler;
 
+    private String deviceId;
     private GpsListener gpsListener;
     private BroadcastReceiver managedConfigurationListener;
     private FifoReadRunnable fifoReadRunnable;
@@ -57,6 +67,8 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
 
     private final QcdmMessageProcessor qcdmMessageProcessor;
     private QcdmPcapWriter qcdmPcapWriter;
+
+    private QcdmMqttConnection qcdmMqttConnection;
 
     public QcdmService()
     {
@@ -79,15 +91,19 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
         fifoReadHandlerThread.start();
         fifoReadHandler = new Handler(fifoReadHandlerThread.getLooper());
 
+        deviceId = createDeviceId();
+
         PreferenceManager.getDefaultSharedPreferences(getApplicationContext()).registerOnSharedPreferenceChangeListener(this);
 
         initializeLocationListener();
 
-        initializeQcdmFeed(); // Must be called after initializing the location listener.
+        initializeQcdmFeed(); // Must be called after initializing the location listener
 
-        updateServiceNotification();
-
+        // Must register for MDM updates AFTER initializing the MQTT connection because we try to make an MQTT connection if the MDM settings change
+        initializeMqttConnection();
         registerManagedConfigurationListener();
+
+        updateServiceNotification(); // Must be called after initializing the MQTT connection
     }
 
     @Override
@@ -107,6 +123,7 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
     @Override
     public IBinder onBind(Intent intent)
     {
+        //noinspection ReturnOfInnerClass
         return qcdmServiceBinder;
     }
 
@@ -142,6 +159,17 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
         {
             qcdmPcapWriter.onSharedPreferenceChanged(sharedPreferences, key);
         }
+    }
+
+    /**
+     * Creates the {@link QcdmMqttConnection} instance.
+     *
+     * @since 0.1.1
+     */
+    public void initializeMqttConnection()
+    {
+        qcdmMqttConnection = new QcdmMqttConnection(deviceId, gpsListener);
+        qcdmMqttConnection.registerMqttConnectionStateListener(this);
     }
 
     /**
@@ -233,7 +261,7 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
     public boolean isBeingUsed()
     {
         return pcapLoggingEnabled.get()
-                //|| getMqttConnectionState() != ConnectionState.DISCONNECTED
+                || getMqttConnectionState() != ConnectionState.DISCONNECTED
                 || qcdmMessageProcessor.isBeingUsed();
     }
 
@@ -286,7 +314,8 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
     }
 
     /**
-     * Register a listener so that if the Managed Config changes we will be notified of the new config.
+     * Register a listener so that if the Managed Config changes we will be notified of the new config
+     * and can restart the MQTT broker connection with the new parameters.
      */
     private void registerManagedConfigurationListener()
     {
@@ -297,6 +326,8 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
             @Override
             public void onReceive(Context context, Intent intent)
             {
+                attemptMqttConnectWithMdmConfig(true);
+
                 if (qcdmPcapWriter != null) qcdmPcapWriter.onMdmPreferenceChanged(context);
             }
         };
@@ -410,7 +441,7 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
     private Notification buildNotification()
     {
         final boolean logging = pcapLoggingEnabled.get();
-        final ConnectionState connectionState = ConnectionState.DISCONNECTED;// TODO mqttConnection.getConnectionState();
+        final ConnectionState connectionState = qcdmMqttConnection.getConnectionState();
         final boolean mqttConnectionActive = connectionState == ConnectionState.CONNECTED || connectionState == ConnectionState.CONNECTING;
         final CharSequence notificationTitle = getText(R.string.network_survey_notification_title);
         final String notificationText = getNotificationText(logging, mqttConnectionActive, connectionState);
@@ -477,14 +508,181 @@ public class QcdmService extends Service implements SharedPreferences.OnSharedPr
     }
 
     /**
+     * Gets the current MQTT connection state.
+     *
+     * @since 0.2.0
+     */
+    @Override
+    public ConnectionState getMqttConnectionState()
+    {
+        if (qcdmMqttConnection != null) return qcdmMqttConnection.getConnectionState();
+
+        return ConnectionState.DISCONNECTED;
+    }
+
+    /**
+     * Adds an {@link com.craxiom.mqttlibrary.IConnectionStateListener} so that it will be notified of all future MQTT connection state changes.
+     *
+     * @param connectionStateListener The listener to add.
+     * @since 0.2.0
+     */
+    @Override
+    public void registerMqttConnectionStateListener(IConnectionStateListener connectionStateListener)
+    {
+        qcdmMqttConnection.registerMqttConnectionStateListener(connectionStateListener);
+    }
+
+    /**
+     * Removes an {@link IConnectionStateListener} so that it will no longer be notified of MQTT connection state changes.
+     *
+     * @param connectionStateListener The listener to remove.
+     * @since 0.2.0
+     */
+    @Override
+    public void unregisterMqttConnectionStateListener(IConnectionStateListener connectionStateListener)
+    {
+        qcdmMqttConnection.unregisterMqttConnectionStateListener(connectionStateListener);
+    }
+
+    /**
+     * Connect to an MQTT broker.
+     *
+     * @param connectionInfo The information needed to connect to the MQTT broker.
+     * @since 0.2.0
+     */
+    @Override
+    public void connectToMqttBroker(BrokerConnectionInfo connectionInfo)
+    {
+        qcdmMqttConnection.connect(getApplicationContext(), connectionInfo);
+
+        qcdmMessageProcessor.registerQcdmMessageListener(qcdmMqttConnection);
+    }
+
+    /**
+     * Disconnects from an MQTT broker.
+     *
+     * @since 0.2.0
+     */
+    @Override
+    public void disconnectFromMqttBroker()
+    {
+        Timber.i("Disconnecting from the MQTT Broker");
+
+        qcdmMessageProcessor.unregisterQcdmMessageListener(qcdmMqttConnection);
+
+        qcdmMqttConnection.disconnect();
+    }
+
+    /**
+     * Attempt an MQTT connection with configuration values provided by MDM control.
+     *
+     * @param forceDisconnect True, if a forced disconnect is desired.
+     * @since 0.2.0
+     */
+    @Override
+    public void attemptMqttConnectWithMdmConfig(boolean forceDisconnect)
+    {
+        if (isMqttMdmOverrideEnabled())
+        {
+            Timber.i("The MQTT MDM override is enabled, so no MDM configured MQTT connection will be attempted");
+            return;
+        }
+
+        final BrokerConnectionInfo connectionInfo = getMdmBrokerConnectionInfo();
+
+        if (connectionInfo != null)
+        {
+            // Make sure there is not another connection active first, if there is, disconnect. Don't use the
+            // disconnectFromMqttBroker() method because it will cause the listener to get unregistered, which will
+            // cause the QcdmService to get stopped if it is the last listener/user of the service.  Since we
+            // are starting the connection right back up there is not a need to remove the listener.
+            qcdmMqttConnection.disconnect();
+
+            connectToMqttBroker(connectionInfo);
+        } else
+        {
+            Timber.i("Skipping the MQTT connection because no MDN MQTT broker configuration has been set");
+
+            if (forceDisconnect) disconnectFromMqttBroker();
+        }
+    }
+
+    /**
+     * @return True if the MQTT MDM override has been enabled by the user.  False if the MDM config should still be employed.
+     * @since 0.2.0
+     */
+    private boolean isMqttMdmOverrideEnabled()
+    {
+        final SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(getApplicationContext());
+        return preferences.getBoolean(MqttConstants.PROPERTY_MQTT_MDM_OVERRIDE, false);
+    }
+
+    /**
+     * Get the MDM configured MQTT broker connection information to use to establish the connection.
+     * <p>
+     * If the user has specified to override the MDM connection config, then null is returned.
+     *
+     * @return The connection settings to use for the MQTT broker, or null if no connection information is present or
+     * the user has overrode the MDM config.
+     * @since 0.2.0
+     */
+    private BrokerConnectionInfo getMdmBrokerConnectionInfo()
+    {
+        final RestrictionsManager restrictionsManager = (RestrictionsManager) getSystemService(Context.RESTRICTIONS_SERVICE);
+        if (restrictionsManager != null)
+        {
+            final Bundle mdmProperties = restrictionsManager.getApplicationRestrictions();
+
+            final boolean hasBrokerHost = mdmProperties.containsKey(MqttConstants.PROPERTY_MQTT_CONNECTION_HOST);
+            if (!hasBrokerHost) return null;
+
+            final String mqttBrokerHost = mdmProperties.getString(MqttConstants.PROPERTY_MQTT_CONNECTION_HOST);
+            final int portNumber = mdmProperties.getInt(MqttConstants.PROPERTY_MQTT_CONNECTION_PORT, MqttConstants.DEFAULT_MQTT_PORT);
+            final boolean tlsEnabled = mdmProperties.getBoolean(MqttConstants.PROPERTY_MQTT_CONNECTION_TLS_ENABLED, MqttConstants.DEFAULT_MQTT_TLS_SETTING);
+            final String clientId = mdmProperties.getString(MqttConstants.PROPERTY_MQTT_CLIENT_ID);
+            final String username = mdmProperties.getString(MqttConstants.PROPERTY_MQTT_USERNAME);
+            final String password = mdmProperties.getString(MqttConstants.PROPERTY_MQTT_PASSWORD);
+
+            if (mqttBrokerHost == null || clientId == null)
+            {
+                return null;
+            }
+
+            return new BrokerConnectionInfo(mqttBrokerHost, portNumber, tlsEnabled, clientId, username, password);
+        }
+
+        return null;
+    }
+
+    /**
+     * @param newConnectionState the new Connection State.
+     * @since 0.2.0
+     */
+    @Override
+    public void onConnectionStateChange(ConnectionState newConnectionState)
+    {
+        updateServiceNotification();
+    }
+
+    /**
      * Class used for the client Binder.  Because we know this service always runs in the same
      * process as its clients, we don't need to deal with IPC.
      */
-    public class QcdmServiceBinder extends Binder
+    public class QcdmServiceBinder extends AConnectionFragment.ServiceBinder
     {
+        @Override
         public QcdmService getService()
         {
             return QcdmService.this;
         }
+    }
+
+    /**
+     * @return The Android ID associated with this device and app.
+     */
+    @SuppressLint("HardwareIds")
+    private String createDeviceId()
+    {
+        return Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
     }
 }

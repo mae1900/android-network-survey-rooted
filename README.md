@@ -1,6 +1,6 @@
 # Network Survey Plus Android App
 
-[![Build Status](https://travis-ci.com/christianrowlands/android-network-survey.svg?branch=develop)](https://travis-ci.com/github/christianrowlands/android-network-survey-plus)
+[![Build Status](https://travis-ci.com/christianrowlands/android-network-survey-rooted.svg?branch=develop)](https://travis-ci.com/github/christianrowlands/android-network-survey-rooted)
 [![License](https://img.shields.io/badge/license-Apache%202-green.svg?style=flat)](https://github.com/christianrowlands/android-network-survey-rooted/blob/develop/LICENSE)
 
 ## What is it?
@@ -74,6 +74,10 @@ are a list of other projects that might be of interest to you.
 
 
 ## Changelog
+
+##### [0.2.0](https://github.com/christianrowlands/android-network-survey-rooted/releases/tag/v0.2.0) - 2021-01-29
+ * Added support for streaming LTE OTA messages over an MQTT connection.
+ * LTE NAS messages are now logged to the pcap file and streamed over MQTT.
 
 ##### [0.1.2](https://github.com/christianrowlands/android-network-survey-rooted/releases/tag/v0.1.2) - 2020-11-02
  * Fixed a bug where the diag_revealer.so file was not being unpacked.
